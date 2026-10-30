@@ -71,4 +71,14 @@ class Qwen3Config:
         if neuron_config is not None:
             filtered_dict["neuron_config"] = neuron_config
 
-        return cls(**filtered_dict)
+        # ROPEFIX: transformers>=5 keeps rope_theta under rope_parameters; the filter above drops it and the
+        # dataclass default (1e6) silently wins. Qwen3-4B-Instruct-2507 needs 5e6.
+        import os as _os, sys as _sys
+        _rp = config_dict.get("rope_parameters") or {}
+        _src = "config.rope_theta" if "rope_theta" in filtered_dict else "dataclass default"
+        if _os.environ.get("COURSE_ROPE_FIX", "1") != "0" and "rope_theta" not in filtered_dict and _rp.get("rope_theta") is not None:
+            filtered_dict["rope_theta"] = float(_rp["rope_theta"]); _src = "rope_parameters.rope_theta"
+        _cfg = cls(**filtered_dict)
+        print(f"ROPEFIX Qwen3Config.rope_theta={_cfg.rope_theta} (source: {_src}; rope_parameters={_rp}; "
+              f"COURSE_ROPE_FIX={_os.environ.get('COURSE_ROPE_FIX', '1')})", file=_sys.stderr, flush=True)
+        return _cfg
