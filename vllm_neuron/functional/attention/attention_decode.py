@@ -15,6 +15,8 @@ from nkilib.experimental.transformer.attention_block_tkg_sharding import (
 from typing import Optional, Tuple
 
 import torch
+import os as _os  # ATTNFIX
+_ATTNFIX_REQUIRE_KERNEL = _os.environ.get('COURSE_ATTN_KERNEL', '1') != '0'  # ATTNFIX
 from torch._subclasses.fake_tensor import FakeTensor
 from torch.distributed import ProcessGroup
 
@@ -1580,6 +1582,16 @@ def attention_decode(
         active_blocks_table=active_blocks_table,
         attention_dp=attention_dp,
     )
+    # ATTNFIX tripwire (evaluated at trace time on static shapes, no logging inside dynamo):
+    # with COURSE_ATTN_KERNEL=1 a GQA caller that handed us a 3D per-head table must reach the
+    # kernel; if it did not, fail the compile loudly instead of silently taking the fallback.
+    if (_ATTNFIX_REQUIRE_KERNEL and kv_heads > 1 and active_blocks_table is not None
+            and active_blocks_table.dim() == 3 and not can_use_kernel):
+        raise RuntimeError(
+            f"ATTNFIX: attention_decode refused the NKI kernel for X={tuple(X.shape)} kv_heads={kv_heads} "
+            f"table={tuple(active_blocks_table.shape)} V_cache={tuple(V_cache.shape)} "
+            f"d_head={V_cache.shape[-1]} on_device={can_run_kernel(X)}"
+        )
 
     # 2D-table GQA is already routed to the torch fallback by
     # _can_use_attention_block_kernel.

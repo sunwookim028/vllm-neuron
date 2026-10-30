@@ -25,6 +25,7 @@ from vllm.distributed.parallel_state import get_tp_group
 from transformers import PretrainedConfig
 
 import vllm_neuron.functional as NF
+import os as _os  # ATTNFIX
 from vllm_neuron.model.kv_cache import KVSpec, LayerSpec
 from vllm_neuron.model.neuron_config import NeuronConfig
 from vllm_neuron.nn.embedding import VocabDimShardedEmbedding
@@ -138,6 +139,20 @@ class Qwen3RotaryEmbedding(nn.Module):
 # Mixed: PARALLELISM (TP head sharding, SP, collectives) +
 #        MODEL-SPECIFIC (GQA, QK-norm per head before RoPE, no bias, no sinks)
 # =============================================================================
+
+
+# ATTNFIX: per-head block table for GQA decode on the nkilib attention_block_tkg kernel.
+# Same contract as model/qwen3_vl/utils/decode_kv.py::build_per_head_block_table: the kernel
+# folds the 4D cache [num_blocks, nkh, blk, d] head-inner into a [num_blocks*nkh] pool, so entry
+# (b, h, j) must be the GLOBAL index block*nkh + h; -1 (inactive) is preserved.
+_ATTN_KERNEL_GQA = _os.environ.get("COURSE_ATTN_KERNEL", "1") != "0"
+logger.info("ATTNFIX patched Qwen3 decoder loaded: per-head GQA block table (NKI kernel path) = %s", _ATTN_KERNEL_GQA)
+
+
+def _per_head_block_table(block_table_2d: torch.Tensor, kv_heads: int) -> torch.Tensor:
+    base = block_table_2d.unsqueeze(1)  # [B, 1, num_blocks]
+    h = torch.arange(kv_heads, dtype=block_table_2d.dtype, device=block_table_2d.device).view(1, kv_heads, 1)
+    return torch.where(base == -1, base, base * kv_heads + h).contiguous()  # [B, kv_heads, num_blocks]
 
 
 class Qwen3Attention(nn.Module):
@@ -466,6 +481,11 @@ class Qwen3Attention(nn.Module):
         )
 
         active_blocks_table = block_table.to(torch.int32)
+        # ATTNFIX: GQA (nkh > 1) is routed to the NKI kernel only with a per-head 3D table;
+        # the stock 2D table makes attention_decode take the torch fallback (see
+        # functional/attention/attention_decode.py::_can_use_attention_block_kernel).
+        if nkh > 1 and _ATTN_KERNEL_GQA:
+            active_blocks_table = _per_head_block_table(active_blocks_table, nkh)
 
         # <-- MODEL-SPECIFIC: rmsnorm_QK_pre_rope_enabled=True for QK-norm;
         # must pass learned gamma weights so decode matches prefill.
@@ -507,6 +527,12 @@ class Qwen3Attention(nn.Module):
         block_indices = slot_mapping // block_size
         position_indices = slot_mapping % block_size
         num_tokens = slot_mapping.shape[0]
+
+        # ATTNFIX: the kernel's GQA path returns K_new [d_head, B, nkh, S]; the torch fallback
+        # (and the kernel with nkh == 1) returns [d_head, B*nkh, S]. Same (b, h) order, so a
+        # reshape makes the scatter below layout-agnostic. V_new is [B, nkh, S, d_head] on both.
+        if K_new.dim() == 4:
+            K_new = K_new.reshape(self.head_dim, B * nkh, S_decode)
 
         k_new = (
             K_new.permute(1, 2, 0)
