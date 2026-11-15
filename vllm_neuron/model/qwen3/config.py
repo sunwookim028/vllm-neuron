@@ -62,6 +62,11 @@ class Qwen3Config:
 
         field_names = {f.name for f in cls.__dataclass_fields__.values()}
         filtered_dict = {k: v for k, v in config_dict.items() if k in field_names}
+        # transformers >= 5 moves rope_theta into rope_parameters; without this the
+        # dataclass default (1e6) silently wins (Qwen3-4B-Instruct-2507 needs 5e6).
+        rope_parameters = config_dict.get("rope_parameters") or {}
+        if "rope_theta" not in filtered_dict and "rope_theta" in rope_parameters:
+            filtered_dict["rope_theta"] = float(rope_parameters["rope_theta"])
 
         if "torch_dtype" in filtered_dict and isinstance(
             filtered_dict["torch_dtype"], str
