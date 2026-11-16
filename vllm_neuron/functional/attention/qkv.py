@@ -291,21 +291,24 @@ def _apply_qk_norm(
         if d_head is not None
         else fused_qkv_dim // (num_q_heads + 2 * num_kv_heads)
     )
-    num_norm_heads = num_q_heads + num_kv_heads
-    for head_idx in range(num_norm_heads):
-        start = head_idx * qk_d_head
-        end = start + qk_d_head
-        head = output[:, :, start:end].float()
+    # Vectorized over heads (was a Python loop of slice-assigns, one per head: at Qwen3-4B TP=1 the
+    # torch fallback runs here and the loop unrolled to 40 heads x 36 layers of norm ops in the prefill graph).
+    B_, S_, _ = output.shape
+    d = qk_d_head
+    parts = []
+    for n_heads, gamma, beta in ((num_q_heads, qk_norm_q_gamma, qk_norm_q_beta),
+                                 (num_kv_heads, qk_norm_k_gamma, qk_norm_k_beta)):
+        start = sum(p.shape[-1] for p in parts)
+        head = output[:, :, start:start + n_heads * d].float().view(B_, S_, n_heads, d)
         variance = head.pow(2).mean(-1, keepdim=True)
         head = head * torch.rsqrt(variance + qk_norm_eps)
-        gamma = qk_norm_q_gamma if head_idx < num_q_heads else qk_norm_k_gamma
         if gamma is not None:
-            head = head * gamma
-        beta = qk_norm_q_beta if head_idx < num_q_heads else qk_norm_k_beta
+            head = head * gamma.reshape(-1, d)
         if beta is not None:
-            head = head + beta
-        output[:, :, start:end] = head.to(output.dtype)
-    return output
+            head = head + beta.reshape(-1, d)
+        parts.append(head.reshape(B_, S_, n_heads * d).to(output.dtype))
+    end = sum(p.shape[-1] for p in parts)
+    return torch.cat(parts + [output[:, :, end:]], dim=-1)
 
 
 def _apply_qkv_output_layout(
@@ -628,24 +631,19 @@ def _torch_qkv_impl(
             else fused_qkv_dim // (num_q_heads + 2 * num_kv_heads)
         )
         num_rope_heads = num_q_heads + num_kv_heads
-
-        for head_idx in range(num_rope_heads):
-            start_idx = head_idx * rope_d_head
-            end_idx = start_idx + rope_d_head
-            half_d = rope_d_head // 2
-
-            head_output = output[:, :, start_idx:end_idx]
-            x1 = head_output[:, :, :half_d]
-            x2 = head_output[:, :, half_d:]
-
-            cos = cos_cache
-            sin = sin_cache[:, :, :half_d]
-
-            rotated_x1 = x1 * cos[:, :, :half_d] - x2 * sin
-            rotated_x2 = x2 * cos[:, :, half_d:] + x1 * sin
-
-            output[:, :, start_idx : start_idx + half_d] = rotated_x1
-            output[:, :, start_idx + half_d : end_idx] = rotated_x2
+        # Vectorized over heads (was a per-head Python loop of slice-assigns; see _apply_qk_norm).
+        half_d = rope_d_head // 2
+        Bo, So, _ = output.shape
+        nr = num_rope_heads * rope_d_head
+        heads = output[:, :, :nr].view(Bo, So, num_rope_heads, rope_d_head)
+        x1 = heads[..., :half_d]
+        x2 = heads[..., half_d:]
+        cos = cos_cache.unsqueeze(2)  # [1, T, 1, Dh]: broadcast over heads
+        sin = sin_cache[:, :, :half_d].unsqueeze(2)
+        rotated_x1 = x1 * cos[..., :half_d] - x2 * sin
+        rotated_x2 = x2 * cos[..., half_d:] + x1 * sin
+        rotated = torch.cat((rotated_x1, rotated_x2), dim=-1).to(output.dtype).reshape(Bo, So, nr)
+        output = torch.cat((rotated, output[:, :, nr:]), dim=-1)
 
     # Step 5.5: Apply per-head QK-norm (post-RoPE)
     if has_post_rope:
